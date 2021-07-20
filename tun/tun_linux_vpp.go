@@ -49,14 +49,14 @@ const (
 
 	ENV_VPP_MEMIF_SOCKET_DIR = "VPP_MEMIF_SOCKET_DIR"
 	ENV_VPP_MEMIF_CONFIG_DIR = "VPP_MEMIF_CONFIG_DIR"
-	ENV_VPP_SOCKET_DIR       = "VPP_SOCKET_DIR"
+	ENV_VPP_SOCKET_PATH      = "VPP_API_SOCKET_PATH"
 )
 
 var (
 	//read from env
-	vppMemifSocketDir = "/var/run/vpp-memif-wg"
+	vppMemifSocketDir = "/var/run/wggo-vpp"
 	vppMemifConfigDir = "/etc/wggo-vpp"
-	vppSocketDir      = socketclient.DefaultSocketName // Path to VPP binary API socket file, default is /run/vpp/api.
+	vppApiSocketPath  = socketclient.DefaultSocketName // Path to VPP binary API socket file, default is /run/vpp/api.
 	//read from json
 	vppBridgeID      = uint32(4242)
 	defaultGwMacAddr = "42:42:42:42:42:42"
@@ -115,7 +115,7 @@ func (tun *NativeTun) File() *os.File {
 
 func (tun *NativeTun) setMTU(n int) error {
 	// connect to VPP
-	conn, err := govpp.Connect(vppSocketDir)
+	conn, err := govpp.Connect(vppApiSocketPath)
 	if err != nil {
 		log.Fatalln("ERROR: connecting to VPP failed:", err)
 	}
@@ -282,6 +282,9 @@ func (tun *NativeTun) Read(buf []byte, offset int) (n int, err error) {
 		tun.logger.Errorf("libmemif.Memif.RxintErr() error: %v\n", err)
 		return 0, err
 	case err = <-tun.errors:
+		if err == nil {
+			err = errors.New("Device closed")
+		}
 		tun.logger.Errorf("tun error: %v\n", err)
 		return 0, err
 	case queueID := <-tun.RxintCh:
@@ -582,7 +585,7 @@ func (tun *NativeTun) Events() chan Event {
 
 func (tun *NativeTun) Close() error {
 	// connect to VPP
-	conn, err := govpp.Connect(vppSocketDir)
+	conn, err := govpp.Connect(vppApiSocketPath)
 	if err != nil {
 		log.Fatalln("ERROR: connecting to VPP failed:", err)
 	}
@@ -597,6 +600,10 @@ func (tun *NativeTun) Close() error {
 
 	memifservice := memif.NewServiceClient(conn)
 
+	tun.events <- EventDown
+	tun.memif.Close()
+	libmemif.Cleanup()
+
 	// delete interface memif memif1/1
 	_, err = memifservice.MemifDelete(context.Background(), &memif.MemifDelete{
 		SwIfIndex: tun.SwIfIndex,
@@ -607,15 +614,9 @@ func (tun *NativeTun) Close() error {
 		SocketID:       tun.ifid,
 		SocketFilename: tun.memifSockPath,
 	})
+	close(tun.errors)
 
-	tun.events <- EventDown
-	var err1 = tun.memif.Close()
-	var err2 = libmemif.Cleanup()
-
-	if err1 != nil {
-		return err1
-	}
-	return err2
+	return nil
 }
 
 func (tun *NativeTun) routineNetlinkListener() {
@@ -634,8 +635,8 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	if os.Getenv(ENV_VPP_MEMIF_CONFIG_DIR) != "" {
 		vppMemifConfigDir = os.Getenv(ENV_VPP_MEMIF_CONFIG_DIR)
 	}
-	if os.Getenv(ENV_VPP_SOCKET_DIR) != "" {
-		vppSocketDir = os.Getenv(vppSocketDir)
+	if os.Getenv(ENV_VPP_SOCKET_PATH) != "" {
+		vppApiSocketPath = os.Getenv(ENV_VPP_SOCKET_PATH)
 	}
 
 	if err := os.MkdirAll(vppMemifSocketDir, 0755); err != nil {
@@ -663,7 +664,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	}
 
 	// connect to VPP
-	conn, err := govpp.Connect(vppSocketDir)
+	conn, err := govpp.Connect(vppApiSocketPath)
 	if err != nil {
 		log.Fatalln("ERROR: connecting to VPP failed:", err)
 	}

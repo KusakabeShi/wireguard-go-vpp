@@ -2,13 +2,41 @@
 
 This is an implementation of WireGuard in Go, but connect to vpp by libmemif instead of use tun device in linux kernel.
 
-## Additional Environment Variables
+## Environment Variables
 
 	VPP_MEMIF_SOCKET_DIR
 	VPP_MEMIF_CONFIG_DIR
-	VPP_SOCKET_DIR
+	VPP_API_SOCKET_PATH
+
+
+* VPP_SOCKET_DIR
+    * default value: `/run/vpp/api.sock`
+    * The api socket to connect to vpp
+* VPP_MEMIF_SOCKET_DIR
+    * default value: `/var/run/wggo-vpp`
+    * The folder to put socket files to communicate between vpp and wggo-vpp
+* VPP_MEMIF_CONFIG_DIR
+    * Default value: `/etc/wggo-vpp`
+    * The folder to put configs 
 
 ## Usage
+
+You have to setup vpp first. Start VPP and run following command in vppcli
+
+if you want to run it in pure userspace, remember to set dpdk config to `"no-pci no-hugetlb"`
+
+Remember to replace the IP Range/MacAddr/BridgeID/InstanceID to what you want
+
+In this case, InstanceID=42 / BridgeID=4242 / MacAddr=42:42:42:42:42:42
+```
+loop create mac 42:42:42:42:42:42 instance 42
+set int l2 bridge loop42 4242 bvi
+set interface mtu 1500 loop42
+set int state loop42 up
+
+set interface ip address loop42 192.168.37.1/24
+set interface ip address loop42 fd42:4242:4242::1/10
+```
 
 Similar to original wireguard-go, but you have to configure some config for the memif.
 
@@ -28,7 +56,7 @@ Create a json file in `/etc/wggo-vpp/wg0.json` with following content:
 
 ```
 
-### JSON parameters
+### parameters
 1. uid: Unique ID for vpp interface id, must be unique in the vpp runtime.
 2. secret: the secret for the connection between vpp and wggo-vpp
 3. IPv4ArpResponseRanges: While DstIP in this range, it will reply the ARP if an ARP request packet received.
@@ -43,9 +71,18 @@ While the JSON configured, you can run wireguard-go-vpp via following command:
 $ wireguard-go wg0
 ```
 
-This will create an memory interface in the vpp and fork into the background. 
+This will create an memif in the vpp and fork into the background. 
 
-It will automatically remove the interface while closing. To remove the interface manually, use this command in the vppcli
+To connect to peers, just like original wireguard-go, use wireguard-tool
+```
+export WG_QUICK_USERSPACE_IMPLEMENTATION=~/wireguard-go-vpp/wireguard
+wg setconf wg0 /etc/wireguard/wg0.conf
+```
+Root permission is not required but you need the read/write access at `/run/vpp/api/api.sock`, `/var/run/vpp-memif-wg` and `/etc/wggo-vpp`. Or you can change the path by environment variables.
+
+`wg-quick` are not supported now.
+
+It will automatically remove the interface while closing. To remove the interface manually, use this command in the vppcli (assume the uid is 3)
 ```
 delete interface memif memif3/3
 delete memif socket id 3
@@ -58,9 +95,17 @@ To run wireguard-go without forking to the background, pass `-f` or `--foregroun
 $ wireguard-go -f wg0
 ```
 
-When an interface is running, you may use [`wg(8)`](https://git.zx2c4.com/wireguard-tools/about/src/man/wg.8) to configure it, as well as the usual `ip(8)` and `ifconfig(8)` commands.
+When an interface is running, you may use [`wg(8)`](https://git.zx2c4.com/wireguard-tools/about/src/man/wg.8) to configure it.
 
 To run with more logging you may set the environment variable `LOG_LEVEL=debug`.
+
+## Make userspace apps join VPP network
+
+Remember to replace the path to real path
+```
+export VCL_VPP_API_SOCKET="/run/vpp/api.sock"
+export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libvcl_ldpreload.so"
+```
 
 ## Platforms
 
@@ -98,3 +143,4 @@ $ make
     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
     SOFTWARE.
+
