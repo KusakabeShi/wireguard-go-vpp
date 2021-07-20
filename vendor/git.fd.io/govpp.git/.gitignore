@@ -1,0 +1,21 @@
+*~
+*.log
+*.out
+*.test
+
+.idea/
+
+/bin/
+
+# cmd
+cmd/binapi-generator/binapi-generator
+cmd/vpp-proxy/vpp-proxy
+
+# examples
+examples/multi-vpp/multi-vpp
+examples/perf-bench/perf-bench
+examples/rpc-service/rpc-service
+examples/simple-client/simple-client
+examples/stats-client/stats-client
+examples/stream-client/stream-client
+examples/union-example/union-example

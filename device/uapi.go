@@ -453,5 +453,6 @@ func (device *Device) IpcHandle(socket net.Conn) {
 			fmt.Fprintf(buffered, "errno=0\n\n")
 		}
 		buffered.Flush()
+		return
 	}
 }

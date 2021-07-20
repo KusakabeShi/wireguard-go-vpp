@@ -1,16 +1,56 @@
 # Go Implementation of [WireGuard](https://www.wireguard.com/)
 
-This is an implementation of WireGuard in Go.
+This is an implementation of WireGuard in Go, but connect to vpp by libmemif instead of use tun device in linux kernel.
+
+## Additional Environment Variables
+
+	VPP_MEMIF_SOCKET_DIR
+	VPP_MEMIF_CONFIG_DIR
+	VPP_SOCKET_DIR
 
 ## Usage
 
-Most Linux kernel WireGuard users are used to adding an interface with `ip link add wg0 type wireguard`. With wireguard-go, instead simply run:
+Similar to original wireguard-go, but you have to configure some config for the memif.
+
+Create a json file in `/etc/wggo-vpp/wg0.json` with following content:
+
+```
+{
+    "uid": 3,
+    "secret": "pwd",
+    "GatewayMacAddr": "42:42:42:42:42:42",
+    "IPv4ArpResponseRanges": [ "192.168.37.128/30" ],
+    "IPv4ArpLearningRanges": [ "192.168.37.0/24" ],
+    "IPv6NdpNeighAdvRanges": [ "fd42::/64" ],
+    "IPv6NdpLearningRanges": [ "fd42::/64" ],
+    "VppBridgeID": 4242
+}
+
+```
+
+### JSON parameters
+1. uid: Unique ID for vpp interface id, must be unique in the vpp runtime.
+2. secret: the secret for the connection between vpp and wggo-vpp
+3. IPv4ArpResponseRanges: While DstIP in this range, it will reply the ARP if an ARP request packet received.
+4. IPv6NdpNeighAdvRanges: Similar to `IPv4ArpResponseRanges`, but it replies Neighbor Advertisement if a Neighbor Solicitation received.
+5. GatewayMacAddr: The mac address of the gateway. If the dstIP out of the learning range defined below will use this Mac address in the vpp side.
+6. IPv4ArpLearningRanges(Optional): Any dstIP within this range, the MacAddress are required to be learned
+7. IPv6NdpLearningRanges(Optional): Same to `IPv4ArpLearningRanges`, but IPv6 version
+
+While the JSON configured, you can run wireguard-go-vpp via following command:
 
 ```
 $ wireguard-go wg0
 ```
 
-This will create an interface and fork into the background. To remove the interface, use the usual `ip link del wg0`, or if your system does not support removing interfaces directly, you may instead remove the control socket via `rm -f /var/run/wireguard/wg0.sock`, which will result in wireguard-go shutting down.
+This will create an memory interface in the vpp and fork into the background. 
+
+It will automatically remove the interface while closing. To remove the interface manually, use this command in the vppcli
+```
+delete interface memif memif3/3
+delete memif socket id 3
+```
+You may instead remove the control socket via `rm -f /var/run/wireguard/wg0.sock`, which will result in wireguard-go shutting down.
 
 To run wireguard-go without forking to the background, pass `-f` or `--foreground`:
 
@@ -24,25 +64,8 @@ To run with more logging you may set the environment variable `LOG_LEVEL=debug`.
 
 ## Platforms
 
-### Linux
+Only linux are tested, other platform may work but I am not sure.
 
-This will run on Linux; however you should instead use the kernel module, which is faster and better integrated into the OS. See the [installation page](https://www.wireguard.com/install/) for instructions.
-
-### macOS
-
-This runs on macOS using the utun driver. It does not yet support sticky sockets, and won't support fwmarks because of Darwin limitations. Since the utun driver cannot have arbitrary interface names, you must either use `utun[0-9]+` for an explicit interface name or `utun` to have the kernel select one for you. If you choose `utun` as the interface name, and the environment variable `WG_TUN_NAME_FILE` is defined, then the actual name of the interface chosen by the kernel is written to the file specified by that variable.
-
-### Windows
-
-This runs on Windows, but you should instead use it from the more [fully featured Windows app](https://git.zx2c4.com/wireguard-windows/about/), which uses this as a module.
-
-### FreeBSD
-
-This will run on FreeBSD. It does not yet support sticky sockets. Fwmark is mapped to `SO_USER_COOKIE`.
-
-### OpenBSD
-
-This will run on OpenBSD. It does not yet support sticky sockets. Fwmark is mapped to `SO_RTABLE`. Since the tun driver cannot have arbitrary interface names, you must either use `tun[0-9]+` for an explicit interface name or `tun` to have the program select one for you. If you choose `tun` as the interface name, and the environment variable `WG_TUN_NAME_FILE` is defined, then the actual name of the interface chosen by the kernel is written to the file specified by that variable.
 
 ## Building
 
