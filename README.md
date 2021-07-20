@@ -61,9 +61,9 @@ Create a json file in `/etc/wggo-vpp/wg0.json` with following content:
 2. secret: the secret for the connection between vpp and wggo-vpp
 3. IPv4ArpResponseRanges: While DstIP in this range, it will reply the ARP if an ARP request packet received.
 4. IPv6NdpNeighAdvRanges: Similar to `IPv4ArpResponseRanges`, but it replies Neighbor Advertisement if a Neighbor Solicitation received.
-5. GatewayMacAddr: The mac address of the gateway. If the dstIP out of the learning range defined below will use this Mac address in the vpp side.
-6. IPv4ArpLearningRanges(Optional): Any dstIP within this range, the MacAddress are required to be learned
-7. IPv6NdpLearningRanges(Optional): Same to `IPv4ArpLearningRanges`, but IPv6 version
+5. GatewayMacAddr: The mac address of the gateway. If the dstIP out of the learning range defined below, it will use this Mac address as DstMacAddr in the vpp side.
+6. IPv4ArpLearningRanges(Optional): Any dstIP within this range, wggo-vpp will lookup it's the MacAddr in the ARP table to fill the layer 2 part. If not in it, it will send an ARP request and drop the original packet.
+7. IPv6NdpLearningRanges(Optional): Same as `IPv4ArpLearningRanges`, but IPv6 version
 
 While the JSON configured, you can run wireguard-go-vpp via following command:
 
@@ -73,9 +73,11 @@ $ wireguard-go wg0
 
 This will create an memif in the vpp and fork into the background. 
 
-To connect to peers, just like original wireguard-go, use wireguard-tool
+To connect to peers, just like original wireguard-go, use wireguard-tool but use custom userspace implantation
+
+Remember to replace the path to real path
 ```
-export WG_QUICK_USERSPACE_IMPLEMENTATION=~/wireguard-go-vpp/wireguard
+export WG_QUICK_USERSPACE_IMPLEMENTATION=$HOME/wireguard-go-vpp/wireguard-go
 wg setconf wg0 /etc/wireguard/wg0.conf
 ```
 Root permission is not required but you need the read/write access at `/run/vpp/api/api.sock`, `/var/run/vpp-memif-wg` and `/etc/wggo-vpp`. Or you can change the path by environment variables.
@@ -117,8 +119,8 @@ Only linux are tested, other platform may work but I am not sure.
 This requires an installation of [go](https://golang.org) ≥ 1.16.
 
 ```
-$ git clone https://git.zx2c4.com/wireguard-go
-$ cd wireguard-go
+$ git clone https://github.com/KusakabeSi/wireguard-go-vpp
+$ cd wireguard-go-vpp
 $ make
 ```
 
