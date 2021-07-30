@@ -11,19 +11,25 @@ package tun
 import (
 	"bytes"
 	"context"
+	crypto_rand "crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
-	"math/rand"
+	"math"
+	math_rand "math/rand"
 	"net"
 	"os"
+	"os/exec"
 	"path"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
-
-	"encoding/json"
 
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
@@ -34,10 +40,15 @@ import (
 	"git.fd.io/govpp.git"
 	"git.fd.io/govpp.git/adapter/socketclient"
 	"git.fd.io/govpp.git/binapi/ethernet_types"
+	"git.fd.io/govpp.git/binapi/fib_types"
 	interfaces "git.fd.io/govpp.git/binapi/interface"
 	"git.fd.io/govpp.git/binapi/interface_types"
+	"git.fd.io/govpp.git/binapi/ip"
+	"git.fd.io/govpp.git/binapi/ip_neighbor"
+	"git.fd.io/govpp.git/binapi/ip_types"
 	"git.fd.io/govpp.git/binapi/l2"
 	"git.fd.io/govpp.git/binapi/memif"
+
 	"git.fd.io/govpp.git/extras/libmemif"
 
 	"github.com/sirupsen/logrus"
@@ -57,20 +68,48 @@ var (
 	vppMemifSocketDir = "/var/run/wggo-vpp"
 	vppMemifConfigDir = "/etc/wggo-vpp"
 	vppApiSocketPath  = socketclient.DefaultSocketName // Path to VPP binary API socket file, default is /run/vpp/api.
-	//read from json
-	vppBridgeID      = uint32(4242)
-	defaultGwMacAddr = "42:42:42:42:42:42"
+
 	//internal
 	NumQueues       = uint8(1)
 	ARP_NS_cooldown = int64(3)
 	onConnectWg     sync.WaitGroup
 	tunErrorChannel chan error
+	thelogger       *logger.Logger
+
+	ifConfig InterfaceConfig
+	gwConfig GatewayConfig
 )
 
+type OperOnIp struct {
+	IPv4   bool
+	IPv6   bool
+	IPv6LL bool `json:"IPv6 link-local"`
+}
+
+type GatewayConfig struct {
+	GatewayMacAddr                     string
+	WgIfMacaddrPrefix                  string // Macaddr = [prefix]:[uid]
+	VppIfMacaddrPrefix                 string
+	VppBridgeLoop_SwIfName             string
+	VppBridgeLoop_SwIfIndex            interface_types.InterfaceIndex
+	VppBridgeLoop_VppctlBinary         string // "vppctl"
+	VppBridgeLoop_InstallMethod        string // "none" "api" "vppctl"
+	VppBridgeLoop_InstallNeighbor      OperOnIp
+	VppBridgeLoop_InstallNeighbor_Flag struct {
+		Static     bool `json:"static"`
+		NoFibEntry bool `json:"no-fib-entry"`
+	}
+	VppBridgeLoop_InstallRoutes         OperOnIp
+	VppBridgeLoop_CheckRouteConflict    bool
+	VppBridgeLoop_CheckRouteConfigPaths []string
+}
+
 type InterfaceConfig struct {
-	Uid                   uint32
-	Secret                string
-	GateWayMacAddr        string
+	Uid          uint32
+	Secret       string
+	Macaddr      string //Overwrite gwConfig.WgIfMacaddrPrefix
+	vppIfMacAddr string
+
 	IPv4ArpResponseRanges []string
 	IPv4ArpLearningRanges []string
 	IPv6NdpNeighAdvRanges []string
@@ -93,8 +132,9 @@ type NativeTun struct {
 	selfIfMacAddr        ethernet_types.MacAddress
 	vppIfMacAddr         ethernet_types.MacAddress
 	gwMacAddr            net.HardwareAddr
-	ifid                 uint32
+	ifuid                uint32
 	SwIfIndex            interface_types.InterfaceIndex
+	VppBridgeID          uint32
 	secret               string
 	RxQueues             int
 	RxintCh              <-chan uint8
@@ -127,7 +167,7 @@ func (tun *NativeTun) setMTU(n int) error {
 		log.Fatalln("ERROR: creating channel failed:", err)
 	}
 	defer ch.Close()
-	if err := ch.CheckCompatiblity(interfaces.AllMessages()...); err != nil {
+	if err := ch.CheckCompatiblity(&interfaces.SwInterfaceSetMtu{}); err != nil {
 		return err
 	}
 	interfacservice := interfaces.NewServiceClient(conn)
@@ -137,7 +177,7 @@ func (tun *NativeTun) setMTU(n int) error {
 		SwIfIndex: tun.SwIfIndex,
 		Mtu:       []uint32{uint32(n)},
 	})
-	if err := ch.CheckCompatiblity(interfaces.AllMessages()...); err != nil {
+	if err != nil {
 		return err
 	}
 	tun.tempMTU = n
@@ -177,7 +217,8 @@ func (tun *NativeTun) getNeighbor(queueID uint8, srcIPv6 [16]byte, dstIPv6 [16]b
 				tun.sendNDNS(queueID, srcIPv6[:], dstIPv6[:])
 				tun.logger.Debugf("Send NS")
 			}
-			return tun.gwMacAddr, errors.New("Dst not reachable")
+			tun.logger.Errorf("Dest not reachable: " + net.IP(dstIPv6[:]).String())
+			return tun.gwMacAddr, errors.New("Dest not reachable: " + net.IP(dstIPv6[:]).String())
 		}
 	}
 	return tun.gwMacAddr, nil
@@ -194,7 +235,8 @@ func (tun *NativeTun) getARP(queueID uint8, srcIPv4 [4]byte, dstIPv4 [4]byte) ([
 				tun.sendARPRequest(queueID, srcIPv4[:], dstIPv4[:])
 				tun.logger.Debugf("Send ARP request")
 			}
-			return tun.gwMacAddr, errors.New("Dst not reachable")
+			tun.logger.Errorf("Dest not reachable: " + net.IP(dstIPv4[:]).String())
+			return tun.gwMacAddr, errors.New("Dest not reachable: " + net.IP(dstIPv4[:]).String())
 		}
 	}
 	return tun.gwMacAddr, nil
@@ -249,7 +291,8 @@ func Key(ip net.IP) string {
 }
 
 // DumpPacket prints a human-readable description of the packet.
-func (tun *NativeTun) DumpPacket(packetData libmemif.RawPacketData) {
+func (tun *NativeTun) DumpPacket(title string, packetData libmemif.RawPacketData) {
+	tun.logger.Debugf(title)
 	packet := gopacket.NewPacket(packetData, layers.LayerTypeEthernet, gopacket.Default)
 	tun.logger.Debugf(packet.Dump())
 }
@@ -303,6 +346,7 @@ func (tun *NativeTun) Read(buf []byte, offset int) (n int, err error) {
 			destMac := packetData[0:6]
 
 			if bytes.Equal(destMac, net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) {
+				tun.DumpPacket("#############Packet Received############", packetData)
 				packet := gopacket.NewPacket(packetData, layers.LayerTypeEthernet, gopacket.Default)
 				ethLayer := packet.Layer(layers.LayerTypeEthernet)
 				if ethLayer == nil {
@@ -337,6 +381,7 @@ func (tun *NativeTun) Read(buf []byte, offset int) (n int, err error) {
 				}
 			}
 			if bytes.Equal(destMac[0:2], []byte{0x33, 0x33}) {
+				tun.DumpPacket("#############Packet Received############", packetData)
 				packet := gopacket.NewPacket(packetData, layers.LayerTypeEthernet, gopacket.Default)
 				ethLayer := packet.Layer(layers.LayerTypeEthernet)
 				if ethLayer == nil {
@@ -371,6 +416,7 @@ func (tun *NativeTun) Read(buf []byte, offset int) (n int, err error) {
 			}
 			if bytes.Equal(destMac, tun.selfIfMacAddr.ToMAC()) {
 				if len(packetData) >= 42 && bytes.Equal(packetData[12:14], []byte{0x08, 0x06}) { //arp
+					tun.DumpPacket("#############Packet Received############", packetData)
 					packet := gopacket.NewPacket(packetData, layers.LayerTypeEthernet, gopacket.Default)
 					ethLayer := packet.Layer(layers.LayerTypeEthernet)
 					if ethLayer == nil {
@@ -387,13 +433,13 @@ func (tun *NativeTun) Read(buf []byte, offset int) (n int, err error) {
 								copy(srcIPv4[:], arp.SourceProtAddress)
 								tun.LearnARP(srcIPv4, eth.SrcMAC)
 								tun.logger.Debugf("received an arp reply, arp learned")
-								tun.DumpPacket(packetData)
 								return 0, nil
 							}
 						}
 					}
 				} else if len(packetData) == 86 && bytes.Equal(packetData[12:14], []byte{0x86, 0xdd}) && packetData[20] == 58 && packetData[54] == 136 {
 					// 86dd: ipv6 / 58: icmpv6  / 135: neighbor adv
+					tun.DumpPacket("#############Packet Received############", packetData)
 					packet := gopacket.NewPacket(packetData, layers.LayerTypeEthernet, gopacket.Default)
 					ethLayer := packet.Layer(layers.LayerTypeEthernet)
 					if ethLayer == nil {
@@ -410,13 +456,12 @@ func (tun *NativeTun) Read(buf []byte, offset int) (n int, err error) {
 							copy(dstip6[:], icmp.TargetAddress)
 							tun.LearnNDP(dstip6, eth.SrcMAC)
 							tun.logger.Debugf("received an NeighborAdvertisement, Neighbor learned")
-							tun.DumpPacket(packetData)
+
 							return 0, nil
 						}
 					}
 				}
 				n = copy(buf[offset:], packetData[14:])
-
 			}
 		}
 	}
@@ -451,10 +496,18 @@ func (tun *NativeTun) sendARPRequest(queueID uint8, srcIPv4 []byte, dstIPv4 []by
 
 	gopacket.SerializeLayers(buf, opts, &eth, &arp)
 	var response = buf.Bytes()
+	tun.DumpPacket("#############Packet Sent############", response)
 
 	_, err := tun.memif.TxBurst(queueID, []libmemif.RawPacketData{response})
 
 	return err
+}
+
+func b2uint8(mybool bool) uint8 {
+	if mybool {
+		return 1
+	}
+	return 0 //you just saved youself an else here!
 }
 
 func (tun *NativeTun) sendARPReply(queueID uint8, l2srcMac []byte, l2dstMac []byte, srcMAC []byte, srcIPv4 []byte, dstMAC []byte, dstIPv4 []byte) (err error) {
@@ -462,6 +515,9 @@ func (tun *NativeTun) sendARPReply(queueID uint8, l2srcMac []byte, l2dstMac []by
 		SrcMAC:       l2srcMac, //hwAddr,
 		DstMAC:       l2dstMac, //eth.SrcMAC,
 		EthernetType: layers.EthernetTypeARP,
+	}
+	if bytes.Equal(dstIPv4, []byte{0, 0, 0, 0}) {
+		copy(dstIPv4, srcIPv4) // Gratuitous ARP
 	}
 	arpResp := layers.ARP{
 		AddrType:          layers.LinkTypeEthernet,
@@ -486,8 +542,73 @@ func (tun *NativeTun) sendARPReply(queueID uint8, l2srcMac []byte, l2dstMac []by
 		return err
 	}
 	var response = buf.Bytes()
+	tun.DumpPacket("#############Packet Sent############", response)
 	_, err = tun.memif.TxBurst(queueID, []libmemif.RawPacketData{response})
-	return nil
+
+	if gwConfig.VppBridgeLoop_InstallNeighbor.IPv4 == false {
+		return err //Skip
+	}
+	switch gwConfig.VppBridgeLoop_InstallMethod {
+	case "api":
+		{
+			// connect to VPP
+			conn, err := govpp.Connect(vppApiSocketPath)
+			if err != nil {
+				log.Fatalln("ERROR: connecting to VPP failed:", err)
+				return err
+			}
+			defer conn.Disconnect()
+
+			// create a channel
+			ch, err := conn.NewAPIChannel()
+			if err != nil {
+				log.Fatalln("ERROR: creating channel failed:", err)
+				return err
+			}
+			defer ch.Close()
+			var srcIPv4_fix16 [16]byte
+			copy(srcIPv4_fix16[:], srcIPv4)
+			ip_neighborservice := ip_neighbor.NewServiceClient(conn)
+			_, err = ip_neighborservice.IPNeighborAddDel(context.Background(), &ip_neighbor.IPNeighborAddDel{
+				IsAdd: true,
+				Neighbor: ip_neighbor.IPNeighbor{
+					SwIfIndex:  interface_types.InterfaceIndex(gwConfig.VppBridgeLoop_SwIfIndex),
+					Flags:      ip_neighbor.IPNeighborFlags(uint8(ip_neighbor.IP_API_NEIGHBOR_FLAG_NO_FIB_ENTRY)*b2uint8(gwConfig.VppBridgeLoop_InstallNeighbor_Flag.NoFibEntry) | uint8(ip_neighbor.IP_API_NEIGHBOR_FLAG_STATIC)*b2uint8(gwConfig.VppBridgeLoop_InstallNeighbor_Flag.Static)),
+					MacAddress: tun.selfIfMacAddr,
+					IPAddress: ip_types.Address{
+						Af: ip_types.ADDRESS_IP4,
+						Un: ip_types.AddressUnion{srcIPv4_fix16},
+					},
+				},
+			})
+			return err
+		}
+	case "vppctl":
+		{
+			var IDs []string
+			for _, i := range srcIPv4 {
+				IDs = append(IDs, strconv.Itoa(int(i)))
+			}
+
+			exec_command := []string{"set", " ip", " neighbor"}
+			exec_command = append(exec_command, gwConfig.VppBridgeLoop_SwIfName, strings.Join(IDs, "."), tun.selfIfMacAddr.ToMAC().String())
+			if gwConfig.VppBridgeLoop_InstallNeighbor_Flag.Static {
+				exec_command = append(exec_command, "static")
+			}
+			if gwConfig.VppBridgeLoop_InstallNeighbor_Flag.NoFibEntry {
+				exec_command = append(exec_command, "no-fib-entry")
+			}
+			tun.logger.Debugf(gwConfig.VppBridgeLoop_VppctlBinary + " " + strings.Join(exec_command, " "))
+			out, err := exec.Command(gwConfig.VppBridgeLoop_VppctlBinary, exec_command...).Output()
+			if err == nil {
+				tun.logger.Debug(string(out))
+			} else {
+				tun.logger.Error(err)
+			}
+			return err
+		}
+	}
+	return err
 }
 
 func (tun *NativeTun) sendNDNS(queueID uint8, l3srcIP []byte, nstrg net.IP) error {
@@ -532,8 +653,14 @@ func (tun *NativeTun) sendNDNS(queueID uint8, l3srcIP []byte, nstrg net.IP) erro
 		return err
 	}
 	var response = buf.Bytes()
+	tun.DumpPacket("#############Packet Sent############", response)
 	_, err = tun.memif.TxBurst(queueID, []libmemif.RawPacketData{response})
-	return nil
+	return err
+}
+
+func isLinkLocal(ip net.IP) bool {
+	_, ll, _ := net.ParseCIDR("fe80::0/10")
+	return ll.Contains(ip)
 }
 
 func (tun *NativeTun) sendNDNA(queueID uint8, l2srcMac []byte, l2dstMac []byte, l3srcIP net.IP, l3DstIP net.IP, natrg net.IP, naData []byte) (err error) {
@@ -576,8 +703,77 @@ func (tun *NativeTun) sendNDNA(queueID uint8, l2srcMac []byte, l2dstMac []byte, 
 		return err
 	}
 	var response = buf.Bytes()
+	tun.DumpPacket("#############Packet Sent############", response)
 	_, err = tun.memif.TxBurst(queueID, []libmemif.RawPacketData{response})
-	return nil
+
+	if gwConfig.VppBridgeLoop_InstallNeighbor.IPv6LL && isLinkLocal(natrg) {
+		// install neighbor
+	} else if gwConfig.VppBridgeLoop_InstallNeighbor.IPv6 && !isLinkLocal(natrg) {
+		// install neighbor
+	} else {
+		return err // Skip
+	}
+	switch gwConfig.VppBridgeLoop_InstallMethod {
+	case "api":
+		{
+			// connect to VPP
+			conn, err := govpp.Connect(vppApiSocketPath)
+			if err != nil {
+				log.Fatalln("ERROR: connecting to VPP failed:", err)
+				return err
+			}
+			defer conn.Disconnect()
+
+			// create a channel
+			ch, err := conn.NewAPIChannel()
+			if err != nil {
+				log.Fatalln("ERROR: creating channel failed:", err)
+				return err
+			}
+			defer ch.Close()
+			var srcIPv6_fix16 [16]byte
+			copy(srcIPv6_fix16[:], natrg.To16())
+			ip_neighborservice := ip_neighbor.NewServiceClient(conn)
+			_, err = ip_neighborservice.IPNeighborAddDel(context.Background(), &ip_neighbor.IPNeighborAddDel{
+				IsAdd: true,
+				Neighbor: ip_neighbor.IPNeighbor{
+					SwIfIndex:  gwConfig.VppBridgeLoop_SwIfIndex,
+					Flags:      ip_neighbor.IPNeighborFlags(uint8(ip_neighbor.IP_API_NEIGHBOR_FLAG_NO_FIB_ENTRY)*b2uint8(gwConfig.VppBridgeLoop_InstallNeighbor_Flag.NoFibEntry) | uint8(ip_neighbor.IP_API_NEIGHBOR_FLAG_STATIC)*b2uint8(gwConfig.VppBridgeLoop_InstallNeighbor_Flag.Static)),
+					MacAddress: tun.selfIfMacAddr,
+					IPAddress: ip_types.Address{
+						Af: ip_types.ADDRESS_IP6,
+						Un: ip_types.AddressUnion{srcIPv6_fix16},
+					},
+				},
+			})
+			return err
+		}
+	case "vppctl":
+		{
+			var IDs []string
+			for _, i := range natrg.To16() {
+				IDs = append(IDs, strconv.Itoa(int(i)))
+			}
+
+			exec_command := []string{"set", " ip", " neighbor"}
+			exec_command = append(exec_command, gwConfig.VppBridgeLoop_SwIfName, natrg.String(), tun.selfIfMacAddr.ToMAC().String())
+			if gwConfig.VppBridgeLoop_InstallNeighbor_Flag.Static {
+				exec_command = append(exec_command, "static")
+			}
+			if gwConfig.VppBridgeLoop_InstallNeighbor_Flag.NoFibEntry {
+				exec_command = append(exec_command, "no-fib-entry")
+			}
+			tun.logger.Debugf(gwConfig.VppBridgeLoop_VppctlBinary + " " + strings.Join(exec_command, " "))
+			out, err := exec.Command(gwConfig.VppBridgeLoop_VppctlBinary, exec_command...).Output()
+			if err == nil {
+				tun.logger.Debug(string(out))
+			} else {
+				tun.logger.Error(err)
+			}
+			return err
+		}
+	}
+	return err
 }
 
 func (tun *NativeTun) Events() chan Event {
@@ -600,10 +796,34 @@ func (tun *NativeTun) Close() error {
 	defer ch.Close()
 
 	memifservice := memif.NewServiceClient(conn)
+	IPService := ip.NewServiceClient(conn)
 
 	tun.events <- EventDown
 	tun.memif.Close()
 	libmemif.Cleanup()
+
+	//ip route add 172.22.77.33/32 via loop42 0.0.0.0
+	if gwConfig.VppBridgeLoop_InstallRoutes.IPv4 {
+		for _, the_ip4 := range tun.selfIPv4ARPRspRanges {
+			err = tun.RouteAddDel(IPService, the_ip4, 4, false, 32)
+			if err != nil {
+				tun.logger.Error(err)
+			}
+		}
+	}
+	if gwConfig.VppBridgeLoop_InstallRoutes.IPv6 || gwConfig.VppBridgeLoop_InstallRoutes.IPv6LL {
+		for _, the_ip6 := range tun.selfIPv6NDPRspRanges {
+			if isLinkLocal(the_ip6.IP) && gwConfig.VppBridgeLoop_InstallRoutes.IPv6LL {
+			} else if gwConfig.VppBridgeLoop_InstallRoutes.IPv6 && !isLinkLocal(the_ip6.IP) {
+			} else {
+				continue
+			}
+			err = tun.RouteAddDel(IPService, the_ip6, 6, false, 128)
+			if err != nil {
+				tun.logger.Error(err)
+			}
+		}
+	}
 
 	// delete interface memif memif1/1
 	_, err = memifservice.MemifDelete(context.Background(), &memif.MemifDelete{
@@ -612,7 +832,7 @@ func (tun *NativeTun) Close() error {
 	// delete memif socket id 1
 	_, err = memifservice.MemifSocketFilenameAddDel(context.Background(), &memif.MemifSocketFilenameAddDel{
 		IsAdd:          false,
-		SocketID:       tun.ifid,
+		SocketID:       tun.ifuid,
 		SocketFilename: tun.memifSockPath,
 	})
 	close(tun.errors)
@@ -628,8 +848,289 @@ func (tun *NativeTun) routineNetlinkListener() {
 	}
 }
 
-func CreateTUN(name string, mtu int) (Device, error) {
+func prefixStr2prefix(prefix string) ([]uint8, uint32, error) {
+	hexStrs := strings.Split(strings.ToLower(prefix), ":")
+	retprefix := make([]uint8, len(hexStrs))
+	maxID := uint32(1)<<((6-len(hexStrs))*8) - 1
+	if len(hexStrs) < 2 || len(hexStrs) > 5 {
+		return []uint8{}, 0, errors.New("Macaddr prefix length must between 2 and 5, " + prefix + " is " + strconv.Itoa(len(hexStrs)))
+	}
+	for index, hexstr := range hexStrs {
+		value, err := strconv.ParseInt(hexstr, 16, 16)
+		if err != nil {
+			return []uint8{}, 0, err
+		}
+		if index == 0 && value%2 != 0 {
+			return []uint8{}, 0, errors.New("Can't use multicast mac address, the first byte of your mac address(" + hexstr + ") must be an even number")
+		}
+		retprefix[index] = uint8(value)
+	}
+	return retprefix, maxID, nil
+}
 
+func checkRouteOverlap(configFolders []string, targetConfigPath string) error {
+	targetConfig := &InterfaceConfig{}
+	targetIPv4ARPRspRanges := []net.IPNet{}
+	targetIPv6NeiRspRanges := []net.IPNet{}
+	byteValue, err := ioutil.ReadFile(targetConfigPath)
+	if err != nil {
+		return err
+	}
+	err = json.Unmarshal(byteValue, &targetConfig)
+	if err != nil {
+		return err
+	}
+	for _, ipv4str := range targetConfig.IPv4ArpResponseRanges {
+		the_ipv4, the_ipv4net, err := net.ParseCIDR(ipv4str)
+		if err != nil {
+			return err
+		}
+		if the_ipv4.To4() == nil {
+			return errors.New(targetConfigPath + ": Not a valid IPv4 CIDR: " + ipv4str)
+		}
+		targetIPv4ARPRspRanges = append(targetIPv4ARPRspRanges, *the_ipv4net)
+	}
+	for _, ipv6str := range targetConfig.IPv6NdpNeighAdvRanges {
+		the_ipv6, the_ipv6net, err := net.ParseCIDR(ipv6str)
+		if err != nil {
+			return err
+		}
+		if the_ipv6.To16() == nil || strings.Contains(ipv6str, ".") {
+			return errors.New(targetConfigPath + ": Not a valid IPv6 CIDR: " + ipv6str)
+		}
+		targetIPv6NeiRspRanges = append(targetIPv6NeiRspRanges, *the_ipv6net)
+	}
+
+	//////////
+	checklist := []string{}
+	for _, configFolder := range configFolders {
+		err = filepath.Walk(configFolder,
+			func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				if info.IsDir() == false {
+					if strings.HasPrefix(info.Name(), "if.") && strings.HasSuffix(info.Name(), ".json") && targetConfigPath != path {
+						checklist = append(checklist, path)
+					}
+				}
+				return nil
+			})
+		if err != nil {
+			return err
+		}
+	}
+	for _, configPath := range checklist {
+		//read json
+		checkConfig := &InterfaceConfig{}
+		checkIPv4ARPRspRanges := []net.IPNet{}
+		checkIPv6NeiRspRanges := []net.IPNet{}
+		byteValue, err := ioutil.ReadFile(configPath)
+		if err != nil {
+			return err
+		}
+		err = json.Unmarshal(byteValue, &checkConfig)
+		if err != nil {
+			return err
+		}
+		if targetConfig.VppBridgeID != checkConfig.VppBridgeID {
+			continue
+		}
+
+		for _, ipv4str := range checkConfig.IPv4ArpResponseRanges {
+			the_ipv4, the_ipv4net, err := net.ParseCIDR(ipv4str)
+			if err != nil {
+				return err
+			}
+			if the_ipv4.To4() == nil {
+				return errors.New(configPath + ": Not a valid IPv4 CIDR: " + ipv4str)
+			}
+			checkIPv4ARPRspRanges = append(checkIPv4ARPRspRanges, *the_ipv4net)
+		}
+		for _, ipv6str := range checkConfig.IPv6NdpNeighAdvRanges {
+			the_ipv6, the_ipv6net, err := net.ParseCIDR(ipv6str)
+			if err != nil {
+				return err
+			}
+			if the_ipv6.To16() == nil || strings.Contains(ipv6str, ".") {
+				return errors.New(configPath + ": Not a valid IPv6 CIDR: " + ipv6str)
+			}
+			checkIPv6NeiRspRanges = append(checkIPv6NeiRspRanges, *the_ipv6net)
+		}
+
+		for _, targetIpv4 := range targetIPv4ARPRspRanges {
+			for _, checkIpv4 := range checkIPv4ARPRspRanges {
+				thelogger.Debugf("Check route overlap between [" + targetIpv4.String() + "] and [" + checkIpv4.String() + "]")
+				if checkIpv4.Contains(targetIpv4.IP) || targetIpv4.Contains(checkIpv4.IP) {
+					return errors.New("Network overlap detected at " + configPath + " with network [" + targetIpv4.String() + "] and [" + checkIpv4.String() + "]")
+				}
+			}
+		}
+
+		for _, targetIpv6 := range targetIPv6NeiRspRanges {
+			for _, checkIpv6 := range checkIPv6NeiRspRanges {
+				thelogger.Debugf("Check route overlap between [" + targetIpv6.String() + "] and [" + checkIpv6.String() + "]")
+				if checkIpv6.Contains(targetIpv6.IP) || targetIpv6.Contains(checkIpv6.IP) {
+					return errors.New("Network overlap detected at " + " and " + configPath + " with network [" + targetIpv6.String() + "] and [" + checkIpv6.String() + "]")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (tun *NativeTun) RouteAddDel(ipservice ip.RPCService, the_ip net.IPNet, version int, IsAdd bool, minlen int) error {
+	the_ip_masklen, _ := the_ip.Mask.Size()
+	the_ip_masklenu := uint8(the_ip_masklen)
+	ipbits := 32
+	if version == 6 {
+		ipbits = 128
+	}
+
+	if ones, bits := the_ip.Mask.Size(); ones < minlen || bits != ipbits {
+		return nil
+	}
+	the_ip_fixlen := [16]uint8{}
+	Af := ip_types.ADDRESS_IP4
+	FibProto := fib_types.FIB_API_PATH_NH_PROTO_IP4
+	if version == 4 {
+		copy(the_ip_fixlen[:], the_ip.IP.To4())
+	} else if version == 6 {
+		Af = ip_types.ADDRESS_IP6
+		FibProto = fib_types.FIB_API_PATH_NH_PROTO_IP6
+		copy(the_ip_fixlen[:], the_ip.IP.To16())
+	} else {
+		return errors.New("version mist be 4 or 6, received " + strconv.Itoa(version))
+	}
+	switch gwConfig.VppBridgeLoop_InstallMethod {
+	case "api":
+		{
+			_, err := ipservice.IPRouteAddDel(context.Background(), &ip.IPRouteAddDel{
+				IsAdd:       IsAdd,
+				IsMultipath: true,
+				Route: ip.IPRoute{
+					TableID:    0,
+					StatsIndex: 0,
+					Prefix: ip_types.Prefix{
+						Address: ip_types.Address{
+							Af: Af,
+							Un: ip_types.AddressUnion{the_ip_fixlen},
+						},
+						Len: the_ip_masklenu,
+					},
+					NPaths: 1,
+					Paths: []fib_types.FibPath{
+						{
+							SwIfIndex:  uint32(gwConfig.VppBridgeLoop_SwIfIndex),
+							TableID:    0,
+							RpfID:      0,
+							Weight:     1,
+							Preference: 1,
+							Type:       fib_types.FIB_API_PATH_TYPE_NORMAL,
+							Flags:      fib_types.FIB_API_PATH_FLAG_NONE,
+							Proto:      FibProto,
+							Nh: fib_types.FibPathNh{
+								Address:            ip_types.AddressUnion{the_ip_fixlen},
+								ViaLabel:           0,
+								ObjID:              0,
+								ClassifyTableIndex: 0,
+							},
+							NLabels:    0,
+							LabelStack: [16]fib_types.FibMplsLabel{},
+						},
+					},
+				},
+			})
+			if err != nil {
+				return err
+			}
+		}
+	case "vppctl":
+		{
+			adddelstr := "del"
+			if IsAdd {
+				adddelstr = "add"
+			}
+
+			ipstr := the_ip.IP.String()
+			exec_command := []string{"ip", "route", adddelstr, ipstr + "/" + strconv.Itoa(the_ip_masklen), "via", ipstr, gwConfig.VppBridgeLoop_SwIfName}
+			tun.logger.Debugf(gwConfig.VppBridgeLoop_VppctlBinary + " " + strings.Join(exec_command, " "))
+			out, err := exec.Command(gwConfig.VppBridgeLoop_VppctlBinary, exec_command...).Output()
+			if err == nil {
+				tun.logger.Debug(string(out))
+			} else {
+				tun.logger.Error(err)
+			}
+		}
+	}
+	return nil
+}
+
+func getRandUint32(max uint32) uint32 {
+	randbyte := make([]byte, 4)
+	randint := math_rand.Uint32()
+	_, err := crypto_rand.Read(randbyte)
+	if err != nil {
+		return randint
+	}
+	randint = binary.BigEndian.Uint32(randbyte)
+	if randint > max {
+		randint = randint % max
+	}
+	return randint
+
+}
+
+func GetSwIfIndexByName(name string) (int, error) {
+	exec_command := []string{"show", "interface", name}
+	thelogger.Debugf(gwConfig.VppBridgeLoop_VppctlBinary + " " + strings.Join(exec_command, " "))
+	out, err := exec.Command(gwConfig.VppBridgeLoop_VppctlBinary, exec_command...).Output()
+	if err != nil {
+		return 0, nil
+	}
+	outstr := string(out)
+	outstrs := strings.Split(outstr, "\n")
+	if len(outstrs) <= 1 {
+		return 0, errors.New(outstr)
+	}
+	infoss := strings.Split(outstrs[1], " ")
+	var infos []string
+	for _, str := range infoss {
+		if str != "" {
+			infos = append(infos, str)
+		}
+	}
+	if len(infos) <= 1 {
+		return 0, errors.New(outstr)
+	}
+	return strconv.Atoi(infos[1])
+}
+
+func CreateTUN(name string, mtu int) (Device, error) {
+	// Set logger
+	thelogger = logger.New()
+	thelogger.Out = os.Stdout
+	thelogger.Level = func() logger.Level {
+		switch os.Getenv("LOG_LEVEL") {
+		case "verbose", "debug":
+			return logger.DebugLevel
+		case "error":
+			return logger.ErrorLevel
+		case "silent":
+			return logger.PanicLevel
+		}
+		return logger.ErrorLevel
+	}()
+	libmemif.SetLogger(thelogger)
+	math_rand.Seed(time.Now().UnixNano())
+	// Make a Regex to say we only want letters and numbers
+	// Remove strange characters from name
+	regpattern, err := regexp.Compile("[^a-zA-Z0-9_\\-]+")
+	if err != nil {
+		log.Fatal(err)
+	}
+	name = regpattern.ReplaceAllString(name, "")
+	// Read required path from env
 	if os.Getenv(ENV_VPP_MEMIF_SOCKET_DIR) != "" {
 		vppMemifSocketDir = os.Getenv(ENV_VPP_MEMIF_SOCKET_DIR)
 	}
@@ -643,25 +1144,95 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	if err := os.MkdirAll(vppMemifSocketDir, 0755); err != nil {
 		return nil, err
 	}
-
-	byteValue, err := ioutil.ReadFile(path.Join(vppMemifConfigDir, name+".json"))
+	//read if.home.json
+	byteValue, err := ioutil.ReadFile(path.Join(vppMemifConfigDir, "if."+name+".json"))
 	if err != nil {
 		return nil, err
 	}
-
-	ifConfig := InterfaceConfig{}
-
 	err = json.Unmarshal(byteValue, &ifConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	if ifConfig.Uid == 0 {
-		ifConfig.Uid = rand.Uint32()
+	//read gw.4242.json and correct value
+	byteValue, err = ioutil.ReadFile(path.Join(vppMemifConfigDir, "gw."+fmt.Sprint(ifConfig.VppBridgeID)+".json"))
+	if err != nil {
+		return nil, err
+	}
+	err = json.Unmarshal(byteValue, &gwConfig)
+	if err != nil {
+		return nil, err
+	}
+	if gwConfig.VppBridgeLoop_VppctlBinary == "" {
+		gwConfig.VppBridgeLoop_VppctlBinary = "vppctl"
+	}
+	if gwConfig.VppBridgeLoop_SwIfIndex == 0 && gwConfig.VppBridgeLoop_InstallMethod == "api" {
+		tempVppBridgeLoop_SwIfIndex, err := GetSwIfIndexByName(gwConfig.VppBridgeLoop_SwIfName)
+		if err != nil {
+			return nil, err
+		}
+		gwConfig.VppBridgeLoop_SwIfIndex = interface_types.InterfaceIndex(tempVppBridgeLoop_SwIfIndex)
 	}
 
-	if ifConfig.VppBridgeID == 0 {
-		ifConfig.VppBridgeID = vppBridgeID
+	err = checkRouteOverlap(gwConfig.VppBridgeLoop_CheckRouteConfigPaths, path.Join(vppMemifConfigDir, "if."+name+".json"))
+	if err != nil {
+		return nil, err
+	}
+
+	gwMacAddr, err := net.ParseMAC(gwConfig.GatewayMacAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate MAC address for vpp interface at layer 2
+	selfIfMacAddr := [6]byte{0x0a, 0x42, 0, 1, 2, 3}
+	vppIfMacAddr := [6]byte{0x0c, 0x42, 0, 1, 2, 3}
+	randUid := getRandUint32(math.MaxInt32)
+	binary.BigEndian.PutUint32(selfIfMacAddr[2:], randUid)
+	binary.BigEndian.PutUint32(vppIfMacAddr[2:], randUid)
+
+	if ifConfig.vppIfMacAddr != "" && ifConfig.Macaddr != "" { // ifConfig Overwrite
+		selfIfMacAddrvslice, err := net.ParseMAC(ifConfig.Macaddr)
+		if err != nil {
+			return nil, err
+		}
+		vppIfMacAddrslice, err := net.ParseMAC(ifConfig.vppIfMacAddr)
+		if err != nil {
+			return nil, err
+		}
+		copy(selfIfMacAddr[:], selfIfMacAddrvslice)
+		copy(vppIfMacAddr[:], vppIfMacAddrslice)
+	} else { //Generate by rule
+		selfIfMacPrefix, maxIDwg, err := prefixStr2prefix(gwConfig.WgIfMacaddrPrefix)
+		if err != nil {
+			thelogger.Error("Prefix parse error: " + gwConfig.WgIfMacaddrPrefix)
+			return nil, err
+		}
+		vppIfMacPrefix, maxIDvpp, err := prefixStr2prefix(gwConfig.VppIfMacaddrPrefix)
+		if err != nil {
+			thelogger.Error("Prefix parse error: " + gwConfig.WgIfMacaddrPrefix)
+			return nil, err
+		}
+
+		if maxIDwg != maxIDvpp {
+			return nil, errors.New("Length of WgIfMacaddrPrefix and VppIfMacaddrPrefix must be same")
+		}
+
+		if ifConfig.Uid == 0 {
+			ifConfig.Uid = getRandUint32(maxIDwg)
+		}
+		if ifConfig.Uid > maxIDwg {
+			return nil, errors.New("UID can't grater than 256^len(MacAddrPrefix) -1 = " + fmt.Sprint(maxIDwg))
+		}
+
+		idbuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(idbuf, ifConfig.Uid)
+		copy(selfIfMacAddr[2:], idbuf)
+		copy(vppIfMacAddr[2:], idbuf)
+
+		copy(selfIfMacAddr[:], selfIfMacPrefix)
+		copy(vppIfMacAddr[:], vppIfMacPrefix)
+
 	}
 
 	// connect to VPP
@@ -686,59 +1257,38 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	}
 	if err := ch.CheckCompatiblity(&l2.L2fibAddDel{}, &l2.SwInterfaceSetL2Bridge{}); err != nil {
 		return nil, err
-	} /*
-		if err := ch.CheckCompatiblity(ip_neighbor.AllMessages()...); err != nil {
-			return nil, err
-		}*/
+	}
+	if err := ch.CheckCompatiblity(&ip_neighbor.IPNeighborAddDel{}); err != nil {
+		return nil, err
+	}
+	if err := ch.CheckCompatiblity(&ip.IPRouteAddDel{}); err != nil {
+		return nil, err
+	}
 
 	memifservice := memif.NewServiceClient(conn)
 	interfacservice := interfaces.NewServiceClient(conn)
 	l2service := l2.NewServiceClient(conn)
-	//ip_neighborservice := ip_neighbor.NewServiceClient(conn)
-
-	// MAC address for vpp l2 interface
-
-	idbuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(idbuf, ifConfig.Uid)
-
-	gwMacAddr, err := net.ParseMAC(ifConfig.GateWayMacAddr)
-	if err != nil {
-		gwMacAddr, _ = net.ParseMAC(defaultGwMacAddr)
-	}
-
-	thelogger := logger.New()
-	thelogger.Out = os.Stdout
-	thelogger.Level = func() logger.Level {
-		switch os.Getenv("LOG_LEVEL") {
-		case "verbose", "debug":
-			return logger.DebugLevel
-		case "error":
-			return logger.ErrorLevel
-		case "silent":
-			return logger.PanicLevel
-		}
-		return logger.ErrorLevel
-	}()
-
-	libmemif.SetLogger(thelogger)
+	ipservice := ip.NewServiceClient(conn)
 
 	tun := &NativeTun{
 		name:                    name,
 		memifSockPath:           path.Join(vppMemifSocketDir, name+".sock"),
-		selfIfMacAddr:           ethernet_types.MacAddress{0x0a, 0x42, idbuf[0], idbuf[1], idbuf[2], idbuf[3]},
-		vppIfMacAddr:            ethernet_types.MacAddress{0x0b, 0x42, idbuf[0], idbuf[1], idbuf[2], idbuf[3]},
+		selfIfMacAddr:           ethernet_types.MacAddress(selfIfMacAddr),
+		vppIfMacAddr:            ethernet_types.MacAddress(vppIfMacAddr),
 		gwMacAddr:               gwMacAddr,
 		selfIPv4ARPTable:        make(map[[4]byte]net.HardwareAddr),
 		selfIPv4ARPTime:         make(map[[4]byte]int64),
 		selfIPv6NeiTable:        make(map[[16]byte]net.HardwareAddr),
 		selfIPv6NeiTime:         make(map[[16]byte]int64),
-		ifid:                    ifConfig.Uid,
+		ifuid:                   ifConfig.Uid,
+		VppBridgeID:             ifConfig.VppBridgeID,
 		tempMTU:                 9000,
 		logger:                  thelogger,
 		events:                  make(chan Event, 5),
 		errors:                  make(chan error, 5),
 		statusListenersShutdown: make(chan struct{}),
 	}
+
 	tunErrorChannel = tun.errors
 	for _, ipv4str := range ifConfig.IPv4ArpResponseRanges {
 		the_ipv4, the_ipv4net, err := net.ParseCIDR(ipv4str)
@@ -755,7 +1305,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		if err != nil {
 			return nil, err
 		}
-		if the_ipv6.To16() == nil {
+		if the_ipv6.To16() == nil || strings.Contains(ipv6str, ".") {
 			return nil, errors.New("Not a valid IPv6 CIDR")
 		}
 		tun.selfIPv6NDPRspRanges = append(tun.selfIPv6NDPRspRanges, *the_ipv6net)
@@ -786,7 +1336,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 
 	_, err = memifservice.MemifSocketFilenameAddDel(context.Background(), &memif.MemifSocketFilenameAddDel{
 		IsAdd:          true,
-		SocketID:       tun.ifid,
+		SocketID:       tun.ifuid,
 		SocketFilename: tun.memifSockPath,
 	})
 	if err != nil {
@@ -800,15 +1350,14 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		Mode:       memif.MEMIF_MODE_API_ETHERNET,
 		RxQueues:   NumQueues, // MEMIF_DEFAULT_RX_QUEUES
 		TxQueues:   NumQueues, // MEMIF_DEFAULT_TX_QUEUES
-		ID:         tun.ifid,
-		SocketID:   tun.ifid,
+		ID:         tun.ifuid,
+		SocketID:   tun.ifuid,
 		RingSize:   1024, // MEMIF_DEFAULT_RING_SIZE
 		BufferSize: 2048, // MEMIF_DEFAULT_BUFFER_SIZE 2048
 		NoZeroCopy: true,
 		HwAddr:     tun.vppIfMacAddr,
 		Secret:     ifConfig.Secret,
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -825,17 +1374,6 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		return nil, err
 	}
 
-	//l2fib add aa:aa:aa:aa:aa:aa 4242 memif1/1 static
-	_, err = l2service.L2fibAddDel(context.Background(), &l2.L2fibAddDel{
-		Mac:       tun.selfIfMacAddr,
-		BdID:      ifConfig.VppBridgeID,
-		SwIfIndex: tun.SwIfIndex,
-		IsAdd:     true,
-		StaticMac: false,
-		FilterMac: false,
-		BviMac:    false,
-	})
-
 	//set interface l2 bridge memif1/1 4242
 	_, err = l2service.SwInterfaceSetL2Bridge(context.Background(), &l2.SwInterfaceSetL2Bridge{
 		RxSwIfIndex: tun.SwIfIndex,
@@ -844,7 +1382,32 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		Shg:         0,
 		Enable:      true,
 	})
+	if err != nil {
+		return nil, err
+	}
 
+	//ip route add 172.22.77.33/32 via loop42 0.0.0.0
+	if gwConfig.VppBridgeLoop_InstallRoutes.IPv4 {
+		for _, the_ip4 := range tun.selfIPv4ARPRspRanges {
+			err = tun.RouteAddDel(ipservice, the_ip4, 4, true, 32)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if gwConfig.VppBridgeLoop_InstallRoutes.IPv6 || gwConfig.VppBridgeLoop_InstallRoutes.IPv6LL {
+		for _, the_ip6 := range tun.selfIPv6NDPRspRanges {
+			if isLinkLocal(the_ip6.IP) && gwConfig.VppBridgeLoop_InstallRoutes.IPv6LL {
+			} else if gwConfig.VppBridgeLoop_InstallRoutes.IPv6 && !isLinkLocal(the_ip6.IP) {
+			} else {
+				continue
+			}
+			err = tun.RouteAddDel(ipservice, the_ip6, 6, true, 128)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	//init libmemif
 	libmemif.Init(tun.name)
 	onConnectWg.Add(1)
@@ -857,7 +1420,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	memifConfig := &libmemif.MemifConfig{
 		MemifMeta: libmemif.MemifMeta{
 			IfName:         tun.name,
-			ConnID:         tun.ifid,
+			ConnID:         tun.ifuid,
 			SocketFilename: tun.memifSockPath,
 			Secret:         tun.secret,
 			IsMaster:       true,
@@ -887,6 +1450,23 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	tun.TxQueues = len(details.TxQueues)
 	go func() { tun.events <- EventUp }()
 
+	//l2fib add aa:aa:aa:aa:aa:aa 4242 memif1/1 static
+	_, err = l2service.L2fibAddDel(context.Background(), &l2.L2fibAddDel{
+		Mac:       tun.selfIfMacAddr,
+		BdID:      ifConfig.VppBridgeID,
+		SwIfIndex: tun.SwIfIndex,
+		IsAdd:     true,
+		StaticMac: false,
+		FilterMac: false,
+		BviMac:    false,
+	})
+	if err != nil {
+		tun.logger.Debug("BdID=" + fmt.Sprintf("%d", ifConfig.VppBridgeID))
+		tun.logger.Debug("SwIfIndex=" + fmt.Sprintf("%d", tun.SwIfIndex))
+		tun.logger.Error(err)
+		//return nil, err
+		//VPP can learn l2fib later if this command failed
+	}
 	return tun, nil
 }
 
