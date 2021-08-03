@@ -110,11 +110,12 @@ type InterfaceConfig struct {
 	Macaddr      string //Overwrite gwConfig.WgIfMacaddrPrefix
 	vppIfMacAddr string
 
-	IPv4ArpResponseRanges []string
-	IPv4ArpLearningRanges []string
-	IPv6NdpNeighAdvRanges []string
-	IPv6NdpLearningRanges []string
-	VppBridgeID           uint32
+	IPv4ArpResponseRanges  []string
+	IPv6NdpNeighAdvRanges  []string
+	GratuitousARPOnStartUP bool
+	IPv6NdpLearningRanges  []string
+	IPv4ArpLearningRanges  []string
+	VppBridgeID            uint32
 }
 
 type NativeTun struct {
@@ -568,6 +569,14 @@ func (tun *NativeTun) sendARPReply(queueID uint8, l2srcMac []byte, l2dstMac []by
 	if gwConfig.VppBridgeLoop_InstallNeighbor.IPv4 == false {
 		return err //Skip
 	}
+	if bytes.Equal(l2dstMac, tun.gwMacAddr) {
+		// Pass check
+	} else if bytes.Equal(l2dstMac, net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) {
+		// Pass check
+	} else {
+		//Install via api only if this ARP reply to the gateway/broadcast/multicast
+		return nil //Otherwise return
+	}
 	switch gwConfig.VppBridgeLoop_InstallMethod {
 	case "api":
 		{
@@ -725,7 +734,14 @@ func (tun *NativeTun) sendNDNA(queueID uint8, l2srcMac []byte, l2dstMac []byte, 
 	var response = buf.Bytes()
 	tun.DumpPacket("#############Packet Sent############", response)
 	_, err = tun.memif.TxBurst(queueID, []libmemif.RawPacketData{response})
-
+	if bytes.Equal(l2dstMac, tun.gwMacAddr) {
+		// Pass check
+	} else if bytes.Equal(l2dstMac[:2], []byte{0x33, 0x33}) {
+		// Pass check
+	} else {
+		//Install via api only if this ARP reply to the gateway/broadcast/multicast
+		return nil //Otherwise return
+	}
 	if gwConfig.VppBridgeLoop_InstallNeighbor.IPv6LL && isLinkLocal(natrg) {
 		// install neighbor
 	} else if gwConfig.VppBridgeLoop_InstallNeighbor.IPv6 && !isLinkLocal(natrg) {
@@ -1488,7 +1504,46 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		//return nil, err
 		//VPP can learn l2fib later if this command failed
 	}
+	selfIfMacAddrs := selfIfMacAddr[:]
+	boardcastMac := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	multicastMac := []byte{0x33, 0x33, 0x00, 0x00, 0x00, 0x01}
+
+	if ifConfig.GratuitousARPOnStartUP {
+		for _, ipv4Net := range tun.selfIPv4ARPRspRanges {
+			mask := binary.BigEndian.Uint32(ipv4Net.Mask)
+			start := binary.BigEndian.Uint32(ipv4Net.IP)
+			finish := (start & mask) | (mask ^ 0xffffffff)
+			// loop through addresses as uint32
+			for i := start; i <= finish; i++ {
+				// convert back to net.IP
+				ip := make(net.IP, 4)
+				binary.BigEndian.PutUint32(ip, i)
+				// Send Gratuitous ARP
+				tun.logger.Debugln("Send Gratuitous ARP: " + ip.String())
+				tun.sendARPReply(0, selfIfMacAddrs, boardcastMac, selfIfMacAddrs, ip.To4(), boardcastMac, ip.To4())
+			}
+		}
+		all_nodes_ipv6 := net.ParseIP("ff02::1")
+		for _, ipv6Net := range tun.selfIPv6NDPRspRanges {
+			start := net.IP(make([]byte, 16))
+			copy(start, ipv6Net.IP)
+			for theIP := start; ipv6Net.Contains(theIP); incIP(theIP) {
+				tun.logger.Debugln("Send unsolicited neighbour advertisement: " + theIP.String())
+				tun.sendNDNA(0, selfIfMacAddrs, multicastMac, theIP, all_nodes_ipv6, theIP, selfIfMacAddrs)
+			}
+
+		}
+	}
 	return tun, nil
+}
+
+func incIP(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
+		}
+	}
 }
 
 // OnConnect is called when a memif connection gets established.

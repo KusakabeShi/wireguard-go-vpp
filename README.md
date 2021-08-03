@@ -87,6 +87,7 @@ Create a json file at `/etc/wggo-vpp/if.home.json` with following content:
         "IPv6NdpNeighAdvRanges": [
                 "fd28:cb8f:4c92::33/128","fe80::42:1817:1/128"
         ],
+        "GratuitousARPOnStartUP": false,
         "IPv4ArpLearningRanges": [  ],
         "IPv6NdpLearningRanges": [  ],
         "VppBridgeID": 4242
@@ -107,8 +108,9 @@ Create a json file at `/etc/wggo-vpp/if.home.json` with following content:
 5. IPv6NdpNeighAdvRanges: Similar to `IPv4ArpResponseRanges`, but it replies Neighbor Advertisement if a Neighbor Solicitation received.
    1. If you add link-local address in this section, mask length must be `128` because VPP doesn't support ipv6 link-local with mask other than `/128`.
    2. You can add multiple `/128` link-local address in this section if you need.
-6. IPv6NdpLearningRanges(Optional): Same as `IPv4ArpLearningRanges`, but it's IPv6 version.
-7. VppBridgeID: VppBridge ID defined in previous section. We need to use this value in next section.
+6. GratuitousARPOnStartUP: Send `Gratuitous ARP` and `Unsolicited Neighbor Advertisement` through all `IPv4ArpResponseRanges` and `IPv6NdpNeighAdvRanges` at `wggo-vpp` start up.
+7. IPv6NdpLearningRanges(Optional): Same as `IPv4ArpLearningRanges`, but it's IPv6 version.
+8. VppBridgeID: VppBridge ID defined in previous section. We need to use this value in next section.
 
 ### Gateway config
 
@@ -129,12 +131,12 @@ Create a json file at `/etc/wggo-vpp/gw.4242.json` with following content:
    "VppBridgeLoop_SwIfName":"loop42",
    "VppBridgeLoop_SwIfIndex":1,
    "VppBridgeLoop_InstallNeighbor":{
-      "IPv4":false,
+      "IPv4":true,
       "IPv6":false,
       "IPv6 link-local":false
    },
    "VppBridgeLoop_InstallNeighbor_Flag":{
-      "static":true,
+      "static":false,
       "no-fib-entry":false
    },
    "VppBridgeLoop_InstallRoutes":{
