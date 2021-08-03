@@ -138,6 +138,7 @@ type NativeTun struct {
 	secret               string
 	RxQueues             int
 	RxintCh              <-chan uint8
+	RxintChNext          chan uint8
 	RxintErrCh           <-chan error
 	TxQueues             int
 	TxCount              uint
@@ -332,6 +333,16 @@ func (tun *NativeTun) Read(buf []byte, offset int) (n int, err error) {
 		tun.logger.Errorf("tun error: %v\n", err)
 		return 0, err
 	case queueID := <-tun.RxintCh:
+		select {
+		case tun.RxintChNext <- queueID:
+			{
+				// Use non-blocking write to prevent program stuck
+			}
+		default:
+			tun.logger.Debugln("Buffer full")
+		}
+
+	case queueID := <-tun.RxintChNext:
 		packets, err := tun.memif.RxBurst(queueID, 1)
 		if err != nil {
 			tun.logger.Errorf("libmemif.Memif.RxBurst() error: %v\n", err)
@@ -339,9 +350,18 @@ func (tun *NativeTun) Read(buf []byte, offset int) (n int, err error) {
 		}
 		if len(packets) == 0 {
 			// No more packets to read until the next interrupt.
-			break
+			return 0, nil
 		}
 		for _, packetData := range packets {
+			select {
+			case tun.RxintChNext <- queueID:
+				{
+					// Use non-blocking write to prevent program stuck
+					// repeatedly call RxBurst() until returns an empty slice of packets
+				}
+			default:
+				tun.logger.Debugln("Buffer full")
+			}
 			//check if dst mac addr is a boardcast mac
 			destMac := packetData[0:6]
 
@@ -1284,6 +1304,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		VppBridgeID:             ifConfig.VppBridgeID,
 		tempMTU:                 9000,
 		logger:                  thelogger,
+		RxintChNext:             make(chan uint8, 1<<6),
 		events:                  make(chan Event, 5),
 		errors:                  make(chan error, 5),
 		statusListenersShutdown: make(chan struct{}),

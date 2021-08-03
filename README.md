@@ -217,6 +217,8 @@ To run with more logging you may set the environment variable `LOG_LEVEL=debug`.
 
 Remember to replace the path to real path
 ```
+export LDP_DEBUG=0
+export VCL_DEBUG=0
 export VCL_VPP_API_SOCKET="/run/vpp/api.sock"
 export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libvcl_ldpreload.so"
 ```
