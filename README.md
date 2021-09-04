@@ -7,6 +7,8 @@ This is an implementation of WireGuard in Go, but connect to vpp by libmemif ins
 	VPP_MEMIF_SOCKET_DIR
 	VPP_MEMIF_CONFIG_DIR
 	VPP_API_SOCKET_PATH
+    WGGO_RECONF_INTERVAL
+    WGGO_RECONF_PATH
 
 
 * VPP_API_SOCKET_PATH
@@ -18,6 +20,8 @@ This is an implementation of WireGuard in Go, but connect to vpp by libmemif ins
 * VPP_MEMIF_CONFIG_DIR
     * Default value: `/etc/wggo-vpp`
     * The folder to put configs 
+* WGGO_RECONF
+    * Issue connamd `wg setconf name WGGO_RECONF_PATH` every `WGGO_RECONF_INTERVAL` seconds.
 
 ## Usage
 

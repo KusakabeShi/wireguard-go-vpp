@@ -61,13 +61,17 @@ const (
 	ENV_VPP_MEMIF_SOCKET_DIR = "VPP_MEMIF_SOCKET_DIR"
 	ENV_VPP_MEMIF_CONFIG_DIR = "VPP_MEMIF_CONFIG_DIR"
 	ENV_VPP_SOCKET_PATH      = "VPP_API_SOCKET_PATH"
+	ENV_RECONF_INTERVAL      = "WGGO_RECONF_INTERVAL"
+	ENV_RECONF_PATH          = "WGGO_RECONF_PATH"
 )
 
 var (
 	//read from env
-	vppMemifSocketDir = "/var/run/wggo-vpp"
-	vppMemifConfigDir = "/etc/wggo-vpp"
-	vppApiSocketPath  = socketclient.DefaultSocketName // Path to VPP binary API socket file, default is /run/vpp/api.
+	vppMemifSocketDir  = "/var/run/wggo-vpp"
+	vppMemifConfigDir  = "/etc/wggo-vpp"
+	vppApiSocketPath   = socketclient.DefaultSocketName // Path to VPP binary API socket file, default is /run/vpp/api.
+	wggoReconfInterval time.Duration
+	wggoReconfPath     string
 
 	//internal
 	NumQueues       = uint8(1)
@@ -196,10 +200,6 @@ func (tun *NativeTun) Name() (string, error) {
 	return tun.name, nil
 }
 
-func (tun *NativeTun) nameSlow() (string, error) {
-	return tun.name, nil
-}
-
 func (tun *NativeTun) getTxQueueID() uint8 {
 	if tun.TxQueues == 1 {
 		return 0
@@ -224,6 +224,13 @@ func (tun *NativeTun) getNeighbor(queueID uint8, srcIPv6 [16]byte, dstIPv6 [16]b
 		}
 	}
 	return tun.gwMacAddr, nil
+}
+
+func IsNotUnicast(mac_in net.HardwareAddr) bool {
+	if mac_in[0]&1 == 0 { // Is unicast
+		return false
+	}
+	return true
 }
 
 func (tun *NativeTun) getARP(queueID uint8, srcIPv4 [4]byte, dstIPv4 [4]byte) ([]byte, error) {
@@ -300,10 +307,13 @@ func (tun *NativeTun) DumpPacket(title string, packetData libmemif.RawPacketData
 }
 
 func (tun *NativeTun) LearnARP(ipv4 [4]byte, macAddr net.HardwareAddr) {
-	if bytes.Equal(tun.selfIPv4ARPTable[ipv4], macAddr) {
+	if IsNotUnicast(macAddr) { // Do not learn to ARP table if it is a boardcast address
 		return
 	}
-	for _, ipv4range := range tun.selfIPv4ARPLrnRanges {
+	if bytes.Equal(tun.selfIPv4ARPTable[ipv4], macAddr) { //Skip if it already exists
+		return
+	}
+	for _, ipv4range := range tun.selfIPv4ARPLrnRanges { //Check it is in the learning range
 		if ipv4range.Contains(net.IP{ipv4[0], ipv4[1], ipv4[2], ipv4[3]}) {
 			tun.selfIPv4ARPTable[ipv4] = macAddr
 		}
@@ -311,6 +321,9 @@ func (tun *NativeTun) LearnARP(ipv4 [4]byte, macAddr net.HardwareAddr) {
 }
 
 func (tun *NativeTun) LearnNDP(ipv6 [16]byte, macAddr net.HardwareAddr) {
+	if IsNotUnicast(macAddr) { // Do not learn to ARP table if it is a boardcast address
+		return
+	}
 	if bytes.Equal(tun.selfIPv6NeiTable[ipv6], macAddr) {
 		return
 	}
@@ -436,7 +449,7 @@ func (tun *NativeTun) Read(buf []byte, offset int) (n int, err error) {
 				}
 			}
 			if bytes.Equal(destMac, tun.selfIfMacAddr.ToMAC()) {
-				if len(packetData) >= 42 && bytes.Equal(packetData[12:14], []byte{0x08, 0x06}) { //arp
+				if len(packetData) >= 42 && bytes.Equal(packetData[12:14], []byte{0x08, 0x06}) { //arp reply
 					tun.DumpPacket("#############Packet Received############", packetData)
 					packet := gopacket.NewPacket(packetData, layers.LayerTypeEthernet, gopacket.Default)
 					ethLayer := packet.Layer(layers.LayerTypeEthernet)
@@ -876,14 +889,6 @@ func (tun *NativeTun) Close() error {
 	return nil
 }
 
-func (tun *NativeTun) routineNetlinkListener() {
-	tun.events <- EventUp
-	select {
-	case <-tun.statusListenersShutdown:
-		return
-	}
-}
-
 func prefixStr2prefix(prefix string) ([]uint8, uint32, error) {
 	hexStrs := strings.Split(strings.ToLower(prefix), ":")
 	retprefix := make([]uint8, len(hexStrs))
@@ -1114,7 +1119,6 @@ func getRandUint32(max uint32) uint32 {
 		randint = randint % max
 	}
 	return randint
-
 }
 
 func GetSwIfIndexByName(name string) (int, error) {
@@ -1164,6 +1168,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	regpattern, err := regexp.Compile("[^a-zA-Z0-9_\\-]+")
 	if err != nil {
 		log.Fatal(err)
+		return nil, err
 	}
 	name = regpattern.ReplaceAllString(name, "")
 	// Read required path from env
@@ -1175,6 +1180,31 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	}
 	if os.Getenv(ENV_VPP_SOCKET_PATH) != "" {
 		vppApiSocketPath = os.Getenv(ENV_VPP_SOCKET_PATH)
+	}
+
+	if os.Getenv(ENV_RECONF_INTERVAL) != "" {
+		secs, err := strconv.ParseFloat(os.Getenv(ENV_RECONF_INTERVAL), 64)
+		if err != nil {
+			log.Fatal(err)
+			return nil, err
+		}
+		wggoReconfInterval = time.Duration(secs * float64(time.Second))
+	}
+
+	if os.Getenv(ENV_RECONF_PATH) != "" {
+		wggoReconfPath = os.Getenv(ENV_RECONF_PATH)
+		fi, err := os.Stat(wggoReconfPath)
+		if err != nil {
+			log.Fatal(wggoReconfPath+": ", err)
+			return nil, err
+		}
+		switch mode := fi.Mode(); {
+		case mode.IsDir():
+			err = errors.New("Is a directory.")
+			log.Fatal(wggoReconfPath+": ", err)
+			return nil, err
+		case mode.IsRegular():
+		}
 	}
 
 	if err := os.MkdirAll(vppMemifSocketDir, 0755); err != nil {
@@ -1485,7 +1515,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	tun.RxintCh = memif.GetInterruptChan()
 	tun.RxintErrCh = memif.GetInterruptErrorChan()
 	tun.TxQueues = len(details.TxQueues)
-	go func() { tun.events <- EventUp }()
+	tun.events <- EventUp
 
 	//l2fib add aa:aa:aa:aa:aa:aa 4242 memif1/1 static
 	_, err = l2service.L2fibAddDel(context.Background(), &l2.L2fibAddDel{
@@ -1534,6 +1564,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 
 		}
 	}
+	go tun.RoutineSetSonf()
 	return tun, nil
 }
 
@@ -1567,4 +1598,25 @@ func OnDisconnect(memif *libmemif.Memif) (err error) {
 
 func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 	return nil, errors.New("Not implement in vpp")
+}
+
+func (tun *NativeTun) RoutineSetSonf() {
+	if wggoReconfInterval <= 0 {
+		return
+	}
+	if wggoReconfPath == "" {
+		return
+	}
+	for {
+		time.Sleep(time.Second)
+		exec_command := []string{"setconf", tun.name, wggoReconfPath}
+		tun.logger.Debugf(strings.Join(exec_command, " "))
+		out, err := exec.Command("wg", exec_command...).Output()
+		if err == nil {
+			tun.logger.Debug(string(out))
+		} else {
+			tun.logger.Error(err)
+		}
+		time.Sleep(wggoReconfInterval)
+	}
 }
