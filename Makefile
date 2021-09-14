@@ -16,6 +16,7 @@ generate-version-and-build:
 	git update-index --assume-unchanged version.go || true
 	@$(MAKE) wireguard-go-vpp
 
+wireguard-go-vpp: export CGO_CFLAGS ?= -I/usr/include/memif
 wireguard-go-vpp: $(wildcard *.go) $(wildcard */*.go)
 	go mod vendor && \
 	patch -p0 -i govpp_remove_crcstring_check.patch && \
