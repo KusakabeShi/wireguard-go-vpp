@@ -1515,7 +1515,6 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	tun.RxintCh = memif.GetInterruptChan()
 	tun.RxintErrCh = memif.GetInterruptErrorChan()
 	tun.TxQueues = len(details.TxQueues)
-	tun.events <- EventUp
 
 	//l2fib add aa:aa:aa:aa:aa:aa 4242 memif1/1 static
 	_, err = l2service.L2fibAddDel(context.Background(), &l2.L2fibAddDel{
@@ -1564,6 +1563,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 
 		}
 	}
+	tun.events <- EventUp
 	go tun.RoutineSetSonf()
 	return tun, nil
 }
@@ -1614,9 +1614,10 @@ func (tun *NativeTun) RoutineSetSonf() {
 		out, err := exec.Command("wg", exec_command...).Output()
 		if err == nil {
 			tun.logger.Debug(string(out))
+			time.Sleep(wggoReconfInterval)
 		} else {
 			tun.logger.Error(err)
+			time.Sleep(time.Second)
 		}
-		time.Sleep(wggoReconfInterval)
 	}
 }
