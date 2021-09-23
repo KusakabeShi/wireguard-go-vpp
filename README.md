@@ -228,6 +228,16 @@ export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libvcl_ldpreload.so"
 
 Only linux are tested, other platform may work but I am not sure.
 
+## Misc VPP command
+```
+show bridge
+show interface
+show int address
+show ip neighbor
+show ip6 neighbor
+show l2fib all
+show session verbose
+```
 
 ## Building
 
