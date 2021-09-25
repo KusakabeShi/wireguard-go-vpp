@@ -1381,7 +1381,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		ifuid:                   ifConfig.Uid,
 		VppBridgeID:             ifConfig.VppBridgeID,
 		tempMTU:                 9000,
-		secret:                  ifConfig.Secret
+		secret:                  ifConfig.Secret,
 		logger:                  thelogger,
 		RxintChNext:             make(chan uint8, 1<<6),
 		events:                  make(chan Event, 5),
