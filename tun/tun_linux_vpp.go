@@ -1162,7 +1162,7 @@ const allowedchars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV
 func RandomStr(length int, defaults string) string {
 	bytes := make([]byte, length)
 
-	if _, err := rand.Read(bytes); err != nil {
+	if _, err := crypto_rand.Read(bytes); err != nil {
 		return defaults
 	}
 
@@ -1249,7 +1249,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	}
 
 	if ifConfig.Secret == "random" {
-		ifConfig.Secret = RandomStr(20)
+		ifConfig.Secret = RandomStr(20,"random")
 	}
 
 	//read gw.4242.json and correct value
