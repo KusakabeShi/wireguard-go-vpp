@@ -1211,7 +1211,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		return nil, err
 	}
 	//read if.home.json
-	byteValue, err := ioutil.ReadFile(path.Join(vppMemifConfigDir, "if."+name+".json"))
+	byteValue, err := ioutil.ReadFile(path.Join(vppMemifConfigDir, "if", name+".json"))
 	if err != nil {
 		return nil, err
 	}
@@ -1221,7 +1221,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	}
 
 	//read gw.4242.json and correct value
-	byteValue, err = ioutil.ReadFile(path.Join(vppMemifConfigDir, "gw."+fmt.Sprint(ifConfig.VppBridgeID)+".json"))
+	byteValue, err = ioutil.ReadFile(path.Join(vppMemifConfigDir, "gw", fmt.Sprint(ifConfig.VppBridgeID)+".json"))
 	if err != nil {
 		return nil, err
 	}
@@ -1240,7 +1240,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		gwConfig.VppBridgeLoop_SwIfIndex = interface_types.InterfaceIndex(tempVppBridgeLoop_SwIfIndex)
 	}
 
-	err = checkRouteOverlap(gwConfig.VppBridgeLoop_CheckRouteConfigPaths, path.Join(vppMemifConfigDir, "if."+name+".json"))
+	err = checkRouteOverlap(gwConfig.VppBridgeLoop_CheckRouteConfigPaths, path.Join(vppMemifConfigDir, "if", name+".json"))
 	if err != nil {
 		return nil, err
 	}
