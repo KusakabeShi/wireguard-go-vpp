@@ -922,6 +922,9 @@ func checkRouteOverlap(configFolders []string, targetConfigPath string) error {
 		return err
 	}
 	for _, ipv4str := range targetConfig.IPv4ArpResponseRanges {
+		if ipv4str == ""{
+			continue
+		}
 		the_ipv4, the_ipv4net, err := net.ParseCIDR(ipv4str)
 		if err != nil {
 			return err
@@ -932,6 +935,9 @@ func checkRouteOverlap(configFolders []string, targetConfigPath string) error {
 		targetIPv4ARPRspRanges = append(targetIPv4ARPRspRanges, *the_ipv4net)
 	}
 	for _, ipv6str := range targetConfig.IPv6NdpNeighAdvRanges {
+		if ipv6str == ""{
+			continue
+		}
 		the_ipv6, the_ipv6net, err := net.ParseCIDR(ipv6str)
 		if err != nil {
 			return err
@@ -979,6 +985,9 @@ func checkRouteOverlap(configFolders []string, targetConfigPath string) error {
 		}
 
 		for _, ipv4str := range checkConfig.IPv4ArpResponseRanges {
+			if ipv4str == ""{
+				continue
+			}
 			the_ipv4, the_ipv4net, err := net.ParseCIDR(ipv4str)
 			if err != nil {
 				return err
@@ -989,6 +998,9 @@ func checkRouteOverlap(configFolders []string, targetConfigPath string) error {
 			checkIPv4ARPRspRanges = append(checkIPv4ARPRspRanges, *the_ipv4net)
 		}
 		for _, ipv6str := range checkConfig.IPv6NdpNeighAdvRanges {
+			if ipv6str == ""{
+				continue
+			}
 			the_ipv6, the_ipv6net, err := net.ParseCIDR(ipv6str)
 			if err != nil {
 				return err
@@ -1146,6 +1158,22 @@ func GetSwIfIndexByName(name string) (int, error) {
 	return strconv.Atoi(infos[1])
 }
 
+const allowedchars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+func RandomStr(length int, defaults string) string {
+	bytes := make([]byte, length)
+
+	if _, err := rand.Read(bytes); err != nil {
+		return defaults
+	}
+
+	for i, b := range bytes {
+		bytes[i] = allowedchars[b%byte(len(allowedchars))]
+	}
+
+	return string(bytes)
+}
+
+
 func CreateTUN(name string, mtu int) (Device, error) {
 	// Set logger
 	thelogger = logger.New()
@@ -1218,6 +1246,10 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	err = json.Unmarshal(byteValue, &ifConfig)
 	if err != nil {
 		return nil, err
+	}
+
+	if ifConfig.Secret == "random" {
+		ifConfig.Secret = RandomStr(20)
 	}
 
 	//read gw.4242.json and correct value
@@ -1349,6 +1381,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		ifuid:                   ifConfig.Uid,
 		VppBridgeID:             ifConfig.VppBridgeID,
 		tempMTU:                 9000,
+		secret:                  ifConfig.Secret
 		logger:                  thelogger,
 		RxintChNext:             make(chan uint8, 1<<6),
 		events:                  make(chan Event, 5),
@@ -1358,6 +1391,9 @@ func CreateTUN(name string, mtu int) (Device, error) {
 
 	tunErrorChannel = tun.errors
 	for _, ipv4str := range ifConfig.IPv4ArpResponseRanges {
+		if ipv4str == ""{
+			continue
+		}
 		the_ipv4, the_ipv4net, err := net.ParseCIDR(ipv4str)
 		if err != nil {
 			return nil, err
@@ -1368,6 +1404,9 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		tun.selfIPv4ARPRspRanges = append(tun.selfIPv4ARPRspRanges, *the_ipv4net)
 	}
 	for _, ipv6str := range ifConfig.IPv6NdpNeighAdvRanges {
+		if ipv6str == ""{
+			continue
+		}
 		the_ipv6, the_ipv6net, err := net.ParseCIDR(ipv6str)
 		if err != nil {
 			return nil, err
@@ -1379,6 +1418,9 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	}
 
 	for _, ipv4str := range ifConfig.IPv4ArpLearningRanges {
+		if ipv4str == ""{
+			continue
+		}
 		the_ipv4, the_ipv4net, err := net.ParseCIDR(ipv4str)
 		if err != nil {
 			return nil, err
@@ -1389,6 +1431,9 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		tun.selfIPv4ARPLrnRanges = append(tun.selfIPv4ARPLrnRanges, *the_ipv4net)
 	}
 	for _, ipv6str := range ifConfig.IPv6NdpLearningRanges {
+		if ipv6str == ""{
+			continue
+		}
 		the_ipv6, the_ipv6net, err := net.ParseCIDR(ipv6str)
 		if err != nil {
 			return nil, err
